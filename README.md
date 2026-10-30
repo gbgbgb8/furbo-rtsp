@@ -120,15 +120,19 @@ encoder runs** (next phase). Audio-only at this point is normal, not a failure.
 
 ## Phase H — encoder on demand
 
-Camera's own SDK tool: `timeout 8 /usr/bin/test_video_service_dyn_air_api --start|--stop`
+Camera's own SDK tool: `timeout -s KILL 10 /usr/bin/test_video_service_dyn_air_api --start|--stop`
 (`--show-stream-status` prints `Stream[n]: encoding` or `No stream in encoding!`;
 `--show-lock-state`, `--show-working-mode` also useful).
 
 - After a **camera reboot**, a bare `--start` can return 0 yet be silently ignored
   until the encoder has been stopped once. Always **stop → wait ~2 s → start**. Bake this into any wrapper.
-- Give it ~10–25 s; the web UI gets sluggish right after. Then Phase-G ffprobe should show real frames (or grab one JPEG frame with ffmpeg).
+- Spin-up is usually ~10–25 s but can take **60–100 s** (notably after a stop or a recovery); the web UI gets sluggish meanwhile. Black video inside the first ~90 s is not a failure — wait, then Phase-G ffprobe / one frame grab.
+- **One start attempt, then hands off.** Overlapping start/stop cycles and RTSP probing during spin-up repeatedly tripped watchdog reboots in our testing (~50 s recovery each, and each reboot restarts the clock). If it hasn't flowed by ~90 s, stop once, wait, start once.
 - Encoder runs warm — don't leave it on 24/7; HA turns it off (Phase I).
 - If RTSP starts **resetting connections on DESCRIBE** after heavy probing, `rtsp_svc` is wedged; don't poke it — `reboot` and wait.
+- The SDK client can block on its IPC socket **ignoring SIGTERM**; a plain `timeout 8` wrapper then leaves a spinning process on the camera. Always wrap as `timeout -s KILL 10`.
+- **Wedged frame pipeline** (signature: load average climbing past ~5, `tfp2pd.log` repeating `Hasn't got any frame in 120 secs. Restart all services`, `cec_snapshot rc=-1` in `dmesg`, `--start` returning 0 but ignored, status clients hanging): warm `reboot` may NOT clear it — the image-sensor/IAV block needs a **full power drain: unplug 60 s**, replug, then hands-off ~5 min (log-only checks) before one start attempt. Verify recovery by load settling near 1 and the restart loop gone, not just by ping.
+- Ground-truth split when stuck: if the owner's **Furbo app live view also fails**, the camera's pipeline is sick (power drain / vendor reset territory). If the app works, the hardware path is fine and only the local trigger sequence is wrong.
 
 ## Phase I — Home Assistant
 
@@ -169,9 +173,22 @@ encoder is up (~8 s), re-declare the stream with all sources:
 `PUT http://<HA_IP>:1984/api/streams?name=furbo&src=ffmpeg:<url>%23video=copy%23audio=copy&src=ffmpeg:furbo%23audio=opus`
 (from the HA host, `127.0.0.1:1984` works). Do this **inside** the start helper so
 every caller (button, presence, manual) gets it. Best-effort: unreachable API must
-not fail the start. Verify via a camera snapshot (`/api/camera_proxy/camera.furbo`
+not fail the start. Verify at the go2rtc layer first (`GET /api/frame.jpeg?src=furbo`
 → 1920×1080 JPEG), not producer state — producers are demand-driven and report
 nothing while nobody watches.
+
+**HA tile lag is normal:** after an encoder (re)start, HA's own camera path
+(`camera_proxy` snapshots, picture-entity live view) can keep failing (HTTP 500)
+for a few minutes *after* go2rtc already serves frames — HA's stream worker
+renegotiates on its own schedule and recovers by itself. A 500 snapshot is not
+proof the stream is down; check go2rtc `frame.jpeg` before touching anything,
+and don't chase HA go2rtc reload endpoints (they errored and weren't needed).
+
+**Set user expectations on the dashboard card:** real spin-up timing (~90 s,
+black at first), WebRTC iframe as the primary live view (it comes up before the
+HA tile), and "don't re-tap while waiting" — with `mode: restart` scripts and a
+stop-first start helper, every extra tap stops the encoder and restarts the
+spin-up clock, which can make a working setup look permanently broken.
 
 HA access pattern (for agents): long-lived token from the user's secret store
 (OS keychain etc.) — **never print it**. REST `/api/states`,
@@ -196,6 +213,10 @@ Backup every HA file before editing (`*.bak-<date>`).
 | Intermittent "camera died" under probing | 5-client RTSP saturation / watchdog | one consumer via go2rtc; wait |
 | `python3` missing in SSH add-on shell | add-on ≠ HA core env | shell_command still fine; test via service |
 | Camera reboots mid-testing | watchdog under sustained load | normal; wait ~60 s, patch persists |
+| `--start` rc=0 but no video; load climbs; `Restart all services` in `tfp2pd.log` | wedged frame pipeline (often after a hard power-cut) | unplug 60 s (not a warm reboot), hands-off 5 min, retry once |
+| Start/stop cycles seem to reboot the camera | thrash during encoder spin-up + probing load | one start attempt, hands off ~90 s |
+| HA snapshot 500, but go2rtc `frame.jpeg` works | HA stream worker not yet renegotiated | wait a few minutes; use WebRTC view; HA recovers alone |
+| Button "never works" when re-tapped | `mode: restart` + stop-first start resets spin-up per tap | tap once, wait the full ~90 s |
 
 ## Revert
 
